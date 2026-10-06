@@ -78,6 +78,46 @@ test('IDB 适配层：during-pages 断电后重开停在旧根', async () => {
   await store2.close();
 });
 
+test('IDB 适配层：深层索引 after-intent 断电重开后，既有键点查询与更新都可用，再开保持健康', async () => {
+  const entries = [];
+  for (let k = 10; k <= 140; k += 10) entries.push([k, `w${k}`]);
+  let store = await IDBStore.open(DB + '-deep');
+  let engine = new Engine(store);
+  await engine.open();
+  await engine.initialize(entries);
+  await engine.submitBatch([
+    { op: 'insert', key: 150, value: 'w150' },
+    { op: 'insert', key: 160, value: 'w160' },
+  ], 'deep-tail', CRASH_POINTS.AFTER_INTENT);
+  await store.close();
+
+  // 全新连接 = 重开复核
+  const store2 = await IDBStore.open(DB + '-deep');
+  const e2 = new Engine(store2);
+  const report = await e2.open();
+  assert.equal(report.conclusion, 'NEW_ROOT_PUBLISHED');
+  const snap = e2.snapshot();
+  assert.equal(snap.audit.pass, true);
+  assert.equal(snap.queryOk, true);
+  assert.equal(snap.keyCount, 16);
+  // 叶序列里存在的既有键必须可经查询路径读取（缺陷场景下此处返回 null）
+  assert.equal(e2.lookup(70).value, 'w70');
+  assert.equal(e2.lookup(160).value, 'w160');
+  const upd = await e2.submitBatch([{ op: 'update', key: 70, value: 'w70-改' }], 'deep-upd');
+  assert.equal(upd.status, 'committed');
+  assert.equal(e2.lookup(70).value, 'w70-改');
+  await store2.close();
+
+  // 再次打开（模拟刷新页面）：INTACT 且现象不复发
+  const store3 = await IDBStore.open(DB + '-deep');
+  const e3 = new Engine(store3);
+  const report3 = await e3.open();
+  assert.equal(report3.conclusion, 'INTACT');
+  assert.equal(e3.lookup(70).value, 'w70-改');
+  assert.equal(e3.snapshot().audit.pass, true);
+  await store3.close();
+});
+
 test('IDB 适配层：单事务 putMany 后根与回执同时可见', async () => {
   const store = await IDBStore.open(DB + "-tx");
   const engine = new Engine(store);

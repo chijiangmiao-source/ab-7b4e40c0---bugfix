@@ -16,9 +16,10 @@ const BASE = process.env.BASE_URL ?? 'http://web';
 let code = await run(process.execPath, [
   '--test',
   'verify/rules.test.mjs',
+  'verify/deep-recovery.test.mjs',
   'verify/idb.integration.test.mjs',
   'verify/dom.test.mjs',
-], '规则、IndexedDB 适配与页面控制层测试（node --test）');
+], '规则、深层索引阶段二恢复、IndexedDB 适配与页面控制层测试（node --test）');
 if (code !== 0) process.exit(code);
 
 code = await run(process.execPath, ['verify/build.mjs'], '页面构建');

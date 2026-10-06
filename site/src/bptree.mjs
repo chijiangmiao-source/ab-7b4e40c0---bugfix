@@ -319,31 +319,82 @@ export function applyEdits(srcPages, rootId, gen, edits) {
       throw new RuleError('UNKNOWN_OP', `未知操作类型: ${op.op}`);
     }
   }
-  if (closure(w, cur).size >= 12) {
-    cur = normalizeDeepSeparators(w, cur);
-  }
   // 仅保留从新根可达的新版本（丢弃分裂/合并过程中的瞬态页）
   const reachable = closure(w, cur);
+  // 发布前在“旧页+新页”的完整视图上独立校验查询路由：
+  // 叶序完整只能证明中序遍历可见，点查询沿分隔键下行，必须单独证明不会错路。
+  const view = new Map();
+  for (const id of reachable) view.set(id, w.get(id));
+  const routingBad = validateRouting(view, cur);
+  if (routingBad.length) {
+    throw new RuleError('BROKEN_ROUTING', '新树查询路径校验失败：' + routingBad.join('；'));
+  }
   const pages = new Map();
   for (const id of reachable) {
-    if (w.out.has(id)) pages.set(id, w.out.get(id));
+    if (w.out.has(id)) pages.set(id, w.get(id));
   }
   return { rootId: cur, gen, pages };
 }
 
-function normalizeDeepSeparators(w, rootId) {
-  const normalize = (id) => {
-    const node = w.get(id);
-    if (!node) throw new Error(`无法闭合的子页引用: ${id}`);
-    if (node.type === 'leaf') return id;
-    const children = node.children.map(normalize);
-    const keys = children.slice(1).map((childId) => {
-      const child = w.get(childId);
-      return child.keys[0];
-    });
-    return w.emit(w.copy(node, { keys, children }));
+// 查询路径不变量（与中序叶序相互独立）：
+//   分隔键严格递增，且对每个分隔键 keys[i]（子节点 children[i] 与 children[i+1] 之间）：
+//     左邻子树最大键 < keys[i] ≤ 右邻子树最小键。
+// 这正是 lookup「while key >= 分隔键 右行」下行规则正确的充要条件：
+// 普通删除后分隔键可以是“旧键副本”（小于右邻新首键，例如删 30 后分隔键仍为 30），
+// 但绝不能大于右邻首键——后者会把属于左邻范围的键送进错误叶页。
+// 返回问题描述数组；空数组代表查询路径与叶序视图一致。
+export function validateRouting(pages, rootId) {
+  const problems = [];
+  const rangeOf = (id, seen) => {
+    if (id == null || seen.has(id)) return null;
+    seen.add(id);
+    const p = pages.get(id);
+    if (!p) { problems.push(`无法闭合的子页引用: ${id}`); return null; }
+    if (p.type === 'leaf') {
+      return p.keys.length ? { min: p.keys[0], max: p.keys[p.keys.length - 1] } : null;
+    }
+    let range = null;
+    for (const c of p.children) {
+      const r = rangeOf(c, seen);
+      if (!r) continue;
+      range = range ? { min: Math.min(range.min, r.min), max: Math.max(range.max, r.max) } : r;
+    }
+    return range;
   };
-  return normalize(rootId);
+  const walk = (id, seen) => {
+    if (id == null || seen.has(id)) {
+      if (id != null) problems.push(`页引用形成环: ${id}`);
+      return;
+    }
+    seen.add(id);
+    const p = pages.get(id);
+    if (!p) { problems.push(`无法闭合的子页引用: ${id}`); return; }
+    if (p.type === 'leaf') {
+      for (let i = 1; i < p.keys.length; i++) {
+        if (!(p.keys[i - 1] < p.keys[i])) problems.push(`叶页 ${id} 的键未严格递增`);
+      }
+      return;
+    }
+    if (p.children.length !== p.keys.length + 1) {
+      problems.push(`内部页 ${id} 的子页数(${p.children.length})与分隔键数(${p.keys.length})不匹配`);
+    }
+    for (let i = 0; i < p.keys.length; i++) {
+      if (i > 0 && !(p.keys[i - 1] < p.keys[i])) {
+        problems.push(`内部页 ${id} 的分隔键未严格递增`);
+      }
+      const left = rangeOf(p.children[i], new Set());
+      const right = rangeOf(p.children[i + 1], new Set());
+      if (left && !(left.max < p.keys[i])) {
+        problems.push(`内部页 ${id} 的分隔键 ${p.keys[i]} 不大于左邻子树最大键 ${left.max}，点查询会错路`);
+      }
+      if (right && !(p.keys[i] <= right.min)) {
+        problems.push(`内部页 ${id} 的分隔键 ${p.keys[i]} 大于右邻子树首键 ${right.min}，点查询会错路`);
+      }
+    }
+    for (const c of p.children) walk(c, seen);
+  };
+  if (rootId != null) walk(rootId, new Set());
+  return problems;
 }
 
 function topFromSplit(w, r) {

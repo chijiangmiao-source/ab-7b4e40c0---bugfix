@@ -8,7 +8,7 @@
 //   意图存在但页缺失/损坏 -> 保留旧根，剔除未竟意图与孤儿页，给出原因
 
 import {
-  applyEdits, buildTree, closure, orderedLeaves, RuleError, ORDER,
+  applyEdits, buildTree, closure, orderedLeaves, validateRouting, RuleError, ORDER,
 } from './bptree.mjs';
 import { fnv1a64, stableStringify, verifyDigest } from './digest.mjs';
 
@@ -129,13 +129,16 @@ export class Engine {
     return src;
   }
 
-  // 校验已发布树的引用闭合与摘要（recover 时已填充 corrupt/loadProblems）
+  // 校验已发布树的引用闭合、摘要与查询路径（recover 时已填充各类问题）
   verifyPublished() {
     if (this.state?.corrupt?.length) {
       throw new RuleError('CORRUPT_DIGEST', this.state.corrupt.join('；'));
     }
     if (this.state?.loadProblems?.length) {
       throw new RuleError('BROKEN_REFERENCE', this.state.loadProblems.join('；'));
+    }
+    if (this.state?.routingProblems?.length) {
+      throw new RuleError('BROKEN_ROUTING', this.state.routingProblems.join('；'));
     }
   }
 
@@ -168,40 +171,111 @@ export class Engine {
     }
     const corrupt = [];
     for (const p of pages.values()) {
-      if (!verifyDigest(p)) corrupt.push(`已发布页 ${p.id} 摘要不匹配`);
+      if (!verifyDigest(p)) corrupt.push(`已发布页 ${p.id} 摘要或内容寻址不匹配`);
     }
+    // 查询路径不变量独立于叶序审计：叶序列严格有序不代表沿分隔键下行能走对叶页
+    const routingProblems = (loadProblems.length || corrupt.length)
+      ? [] : validateRouting(pages, rootRec.rootId);
     const keySet = new Set(rootRec.keys ?? []);
-    this.state = { rootId: rootRec.rootId, gen: rootRec.gen, pages, keySet, corrupt, loadProblems };
+    this.state = { rootId: rootRec.rootId, gen: rootRec.gen, pages, keySet, corrupt, loadProblems, routingProblems };
 
-    let report;
     if (loadProblems.length || corrupt.length) {
-      // 已发布根自身不可信：绝不自动改写，批次操作一律拒绝直到人工处理
-      report = this.recoveryReport('PUBLISHED_ROOT_UNHEALTHY',
-        `已发布根（代次 ${rootRec.gen}）健康检查失败：${[...loadProblems, ...corrupt].join('；')}。冻结于该根，不发布任何新树`);
+      // 已发布根硬损伤（缺页 / 摘要损坏 / 内容寻址不符）：绝不自动改写，批次一律拒绝
       if (intent) await this.abandonIntent(intent, '已发布根不健康，未竟意图不予执行');
-    } else if (!intent) {
-      report = this.recoveryReport('INTACT', '未发现未完成批次，查询视图即已发布根');
-      await this.gcUnreachable(pages); // 上次断电在新页阶段留下的半写入孤儿
-    } else if (intent.rootId === rootRec.rootId || intent.gen === rootRec.gen) {
+      return this.recoveryReport('PUBLISHED_ROOT_UNHEALTHY',
+        `已发布根（代次 ${rootRec.gen}）健康检查失败：${[...loadProblems, ...corrupt].join('；')}。冻结于该根，不发布任何新树`);
+    }
+
+    // 根尚未切换的待决意图：先凭证据判定新根能否发布（发布要求查询路径同时成立）；
+    // 证据不足回滚后继续走下面的“已发布根处置”，旧根本身的查询路径也会被同样核验。
+    this.lastRolledBackDetail = null;
+    if (intent && intent.rootId !== rootRec.rootId && intent.gen !== rootRec.gen) {
+      const pending = await this.resolvePending(intent, rootRec);
+      if (pending) return pending;
+    }
+    const stillIntent = await this.store.get(K_INTENT);
+
+    // 已发布根即当前查询视图（无意图、根已切换后尚未清理意图，或待决意图刚被回滚）
+    if (this.state.routingProblems.length) {
+      // 历史缺陷版本可能已把“叶序正确但查询路径失效”的根持久化：
+      // 页全部真实完整时，按随根原子提交的键集合核验叶数据无损，再确定性重建内部结构。
+      const repaired = await this.repairPublishedRoot(rootRec, pages, stillIntent);
+      if (repaired.ok) {
+        return this.recoveryReport('PUBLISHED_ROOT_REPAIRED',
+          (this.lastRolledBackDetail ? this.lastRolledBackDetail + '；' : '') +
+          `已发布根（代次 ${rootRec.gen}）的叶数据完整无损，但内部查询路径失效（${routingProblems.join('；')}）；` +
+          `已依据 ${rootRec.keys?.length ?? 0} 个叶键安全重建为可查询根，所有既有键均可读取与编辑`);
+      }
+      if (stillIntent) await this.abandonIntent(stillIntent, '已发布根查询路径失效且无法安全重建，未竟意图不予执行');
+      return this.recoveryReport('PUBLISHED_ROOT_UNHEALTHY',
+        `已发布根（代次 ${rootRec.gen}）查询路径失效且叶数据与已提交键集合不一致，不能安全重建：${[...this.state.routingProblems, ...repaired.reasons].join('；')}。冻结于该根`);
+    }
+
+    // 待决批次因证据不足刚被回滚、旧根本身健康：交付“保留旧根”结论
+    if (this.lastRolledBackDetail) {
+      return this.recoveryReport('OLD_ROOT_RETAINED', this.lastRolledBackDetail);
+    }
+
+    if (stillIntent) {
       // 根已切换后在清理前断电
       await this.store.delete(K_INTENT);
       await this.gcUnreachable(pages);
-      report = this.recoveryReport('NEW_ROOT_PUBLISHED',
-        `批次 ${intent.batchId} 的根指针已切换（代次 ${intent.gen}），仅补完清理；新树可完整遍历`);
-    } else {
-      report = await this.resolvePending(intent);
+      return this.recoveryReport('NEW_ROOT_PUBLISHED',
+        `批次 ${stillIntent.batchId} 的根指针已切换（代次 ${stillIntent.gen}），仅补完清理；新树查询路径可完整走通`);
     }
+
+    const report = this.recoveryReport('INTACT', '未发现未完成批次，查询视图即已发布根');
+    await this.gcUnreachable(pages); // 上次断电在新页阶段留下的半写入孤儿
     return report;
   }
 
-  // 意图存在但根尚未切换：凭证据决定发布新根或退回旧根
-  async resolvePending(intent) {
+  // 已发布根“叶数据完好但内部查询路径失效”时的确定性自愈：
+  // 仅在全部页闭合、摘要与内容寻址均通过时可调用；以随根原子提交的键集合为权威，
+  // 严格比对叶序无损后，由叶内容重建整树（内容寻址使未变叶页 id 不变）。
+  async repairPublishedRoot(rootRec, pages, intent) {
+    const reasons = [];
+    let leafKeys = [];
+    try {
+      leafKeys = orderedLeaves(pages, rootRec.rootId).flatMap((l) => l.keys);
+    } catch (e) {
+      return { ok: false, reasons: [e.message] };
+    }
+    const leafOrdered = leafKeys.every((k, i) => i === 0 || leafKeys[i - 1] < k);
+    const committed = [...(rootRec.keys ?? [])].sort((a, b) => a - b);
+    if (!leafOrdered) reasons.push('叶序列并非严格递增、每键一次，无法判定权威数据');
+    if (leafKeys.length !== committed.length || leafKeys.some((k, i) => k !== committed[i])) {
+      reasons.push('叶序键集合与根记录中原子提交的键集合不一致，存在丢失或多余键');
+    }
+    if (reasons.length) return { ok: false, reasons };
+
+    const entries = orderedLeaves(pages, rootRec.rootId).flatMap((l) =>
+      l.keys.map((k, i) => [k, l.values[i]]));
+    const { rootId, pages: rebuilt } = buildTree(rootRec.gen, entries);
+    if (validateRouting(rebuilt, rootId).length) {
+      return { ok: false, reasons: ['重建后的树查询路径校验仍失败'] };
+    }
+    for (const p of rebuilt.values()) await this.store.put(K_PAGE(p.id), p);
+    await this.store.put(K_ROOT, {
+      _id: K_ROOT, rootId, gen: rootRec.gen, keys: committed, repairedAt: this.now(),
+    });
+    if (intent) await this.store.delete(K_INTENT);
+    this.state = {
+      rootId, gen: rootRec.gen, pages: rebuilt,
+      keySet: new Set(committed), corrupt: [], loadProblems: [], routingProblems: [],
+    };
+    await this.gcUnreachable(rebuilt, rootId);
+    return { ok: true, reasons: [] };
+  }
+
+  // 意图存在但根尚未切换：凭证据决定发布新根或退回旧根。
+  // 返回恢复报告（已发布新根）；证据不足回滚时返回 null，由调用方继续核验旧根。
+  async resolvePending(intent, rootRec) {
     const problems = [];
     const newPages = new Map(this.state.pages);
     for (const id of intent.pageIds) {
       const p = await this.store.get(K_PAGE(id));
       if (!p) { problems.push(`新页 ${id} 缺失（半写入）`); continue; }
-      if (!verifyDigest(p)) { problems.push(`新页 ${id} 摘要损坏`); continue; }
+      if (!verifyDigest(p)) { problems.push(`新页 ${id} 摘要或内容寻址损坏`); continue; }
       newPages.set(id, p);
     }
     let closureOk = true;
@@ -213,6 +287,17 @@ export class Engine {
         closureOk = false;
         problems.push(e.message);
       }
+    }
+    // 引用闭合只保证“走得到页”，还要保证“走对页”：校验沿分隔键的查询路径，
+    // 并比对意图携带的键集合与新树叶序，三者（闭合/路由/键集合）同证才可发布
+    if (problems.length === 0 && closureOk) {
+      const routingProblems = validateRouting(newPages, intent.rootId);
+      const leafKeys = orderedLeaves(newPages, intent.rootId).flatMap((l) => l.keys);
+      const intentKeys = [...(intent.keys ?? [])].sort((a, b) => a - b);
+      if (leafKeys.length !== intentKeys.length || leafKeys.some((k, i) => k !== intentKeys[i])) {
+        routingProblems.push('意图键集合与新树叶序列不一致');
+      }
+      if (routingProblems.length) problems.push(...routingProblems);
     }
 
     if (problems.length === 0 && closureOk) {
@@ -229,22 +314,29 @@ export class Engine {
       await this.store.delete(K_INTENT);
       this.state = {
         rootId: intent.rootId, gen: intent.gen, pages: newPages,
-        keySet: new Set(intent.keys ?? []), corrupt: [], loadProblems: [],
+        keySet: new Set(intent.keys ?? []), corrupt: [], loadProblems: [], routingProblems: [],
       };
       await this.gcUnreachable(newPages, intent.rootId);
       return this.recoveryReport('NEW_ROOT_PUBLISHED',
-        `批次 ${intent.batchId} 的新页与意图均完整，发布代次 ${intent.gen} 新根，新树可从根完整遍历，旧版本页已不可查询`);
+        `批次 ${intent.batchId} 的新页与意图均完整，发布代次 ${intent.gen} 新根：引用闭合、查询路径与叶序审计同时通过，旧版本页已不可查询`);
     }
 
-    // 证据不足：退回旧根，清理该批次孤儿页与未竟意图（根指针从未改变）
+    // 证据不足（缺页 / 摘要损坏 / 引用无法闭合 / 查询路径失效）：退回旧根，
+    // 清理该批次孤儿页与未竟意图（根指针从未改变）
     await this.store.delete(K_INTENT);
     await this.gcUnreachable(this.state.pages);
     await this.store.put(K_RECEIPT(intent.batchId), {
       batchId: intent.batchId, editDigest: intent.editDigest, status: 'rolled-back',
       gen: intent.gen, reason: problems.join('；'), createdAt: this.now(),
     });
-    return this.recoveryReport('OLD_ROOT_RETAINED',
-      `批次 ${intent.batchId} 持久化证据不完整（${problems.join('；')}），保留代次 ${this.state.gen} 旧根，半写入页不进入查询视图`);
+    // 旧根本身的查询路径交由 recover 主流程继续核验（历史上已持久化的坏根也要收敛）
+    this.state = {
+      rootId: rootRec.rootId, gen: rootRec.gen, pages: this.state.pages,
+      keySet: new Set(rootRec.keys ?? []), corrupt: [], loadProblems: [],
+      routingProblems: validateRouting(this.state.pages, rootRec.rootId),
+    };
+    this.lastRolledBackDetail = `批次 ${intent.batchId} 持久化证据不完整（${problems.join('；')}），保留代次 ${rootRec.gen} 旧根，半写入页不进入查询视图`;
+    return null;
   }
 
   recoveryReport(conclusion, detail) {
@@ -265,7 +357,7 @@ export class Engine {
     // 先全部新页，最后切根——与批次同一套写时复制纪律
     for (const p of pageMap.values()) await this.store.put(K_PAGE(p.id), p);
     await this.store.put(K_ROOT, { _id: K_ROOT, rootId, gen, keys });
-    this.state = { rootId, gen, pages: pageMap, keySet: new Set(keys), corrupt: [], loadProblems: [] };
+    this.state = { rootId, gen, pages: pageMap, keySet: new Set(keys), corrupt: [], loadProblems: [], routingProblems: [] };
     return this.snapshot();
   }
 
@@ -373,7 +465,7 @@ export class Engine {
     const combined = this.allPagesAfter(result);
     await this.gcUnreachable(combined, result.rootId);
 
-    this.state = { rootId: result.rootId, gen, pages: combined, keySet: new Set(nextKeys), corrupt: [], loadProblems: [] };
+    this.state = { rootId: result.rootId, gen, pages: combined, keySet: new Set(nextKeys), corrupt: [], loadProblems: [], routingProblems: [] };
     return { ...committedReceipt(intentRec, this.now()), replayed: false };
   }
 
@@ -404,6 +496,9 @@ export class Engine {
 
   snapshot() {
     const snap = snapshotOf(this.state.pages, this.state.rootId, this.state.gen, this.lastRecovery);
+    // 点查询路径与叶序审计并列：任一方失败都不得显示为健康
+    snap.routingProblems = snap.badReferences.length ? [] : validateRouting(this.state.pages, this.state.rootId);
+    snap.queryOk = snap.routingProblems.length === 0 && snap.badReferences.length === 0;
     if (this.state.keySet) snap.audit = auditKeys(snap, this.state.keySet);
     return snap;
   }
@@ -482,7 +577,9 @@ export function snapshotOf(pages, rootId, gen, recovery = null) {
   };
 }
 
-// 对照期望键集合核验“分裂后所有键仍恰好一次”
+// 对照期望键集合核验“分裂后所有键仍恰好一次”。
+// 注意：叶序审计通过 != 索引可查询——还须 snapshot.queryOk（点查询路径不变量）成立，
+// 否则会出现叶序列里有键、lookup 却走到错误叶页而报未找到的假健康状态。
 export function auditKeys(snapshot, expectedKeys) {
   const got = snapshot.leafSequence.map((x) => x.key);
   const exp = [...expectedKeys].sort((a, b) => a - b);
@@ -490,7 +587,8 @@ export function auditKeys(snapshot, expectedKeys) {
   const extra = got.filter((k) => !expectedKeys.has(k));
   const dupes = got.filter((k, i) => got.indexOf(k) !== i);
   return {
-    pass: snapshot.allKeysOnce && missing.length === 0 && extra.length === 0 && dupes.length === 0,
+    pass: snapshot.queryOk !== false
+      && snapshot.allKeysOnce && missing.length === 0 && extra.length === 0 && dupes.length === 0,
     expectedCount: expectedKeys.size,
     actualCount: got.length,
     missing, extra, dupes,

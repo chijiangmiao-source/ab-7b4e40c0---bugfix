@@ -39,6 +39,7 @@ const BANNER_CLASS = {
   FRESH: 'fresh',
   INTACT: 'intact',
   NEW_ROOT_PUBLISHED: 'new',
+  PUBLISHED_ROOT_REPAIRED: 'repaired',
   OLD_ROOT_RETAINED: 'old',
   PUBLISHED_ROOT_UNHEALTHY: 'unhealthy',
 };
@@ -46,6 +47,7 @@ const BANNER_TITLE = {
   FRESH: '空库',
   INTACT: '复核通过',
   NEW_ROOT_PUBLISHED: '发布完整新根',
+  PUBLISHED_ROOT_REPAIRED: '已发布根查询路径自愈',
   OLD_ROOT_RETAINED: '保留旧根',
   PUBLISHED_ROOT_UNHEALTHY: '已发布根不健康',
 };
@@ -277,6 +279,12 @@ function renderAudit(snap) {
   if (a.extra.length) lines.push(['fail', '✘', `多余的键：${a.extra.map(chip).join('')}`]);
   if (snap.badReferences.length) {
     lines.push(['fail', '✘', `无法闭合的子页引用：${snap.badReferences.map(chip).join('')}`]);
+  }
+  // 点查询路径独立于叶序审计：叶序列完整不代表查询能走对叶页
+  if (snap.routingProblems?.length) {
+    for (const rp of snap.routingProblems) lines.push(['fail', '✘', `点查询路径失效：${escapeHtml(rp)}`]);
+  } else {
+    lines.push(['pass', '✔', `点查询路径校验：沿分隔键下行可将全部 ${a.actualCount} 个键送达其唯一叶页，读取与更新路径与叶序视图一致。`]);
   }
   els['audit-out'].innerHTML = lines
     .map(([cls, mark, text]) => `<div class="line ${cls}"><span class="mark">${mark}</span><span>${text}</span></div>`)

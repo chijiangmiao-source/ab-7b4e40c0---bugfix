@@ -39,5 +39,10 @@ export function digestPage(page) {
 
 export function verifyDigest(page) {
   if (!page || typeof page.digest !== 'string') return false;
-  return digestPage(page) === page.digest;
+  if (digestPage(page) !== page.digest) return false;
+  // 内容寻址自检：存储地址 id 必须由正文摘要派生。
+  // 仅校验 digest 字段不够——digest 与正文自洽但 id 伪造/漂移时，
+  // 按 id 索页仍会取到张冠李戴的页，破坏引用闭合与查询路径。
+  if (page.id != null && page.id !== 'p' + page.digest) return false;
+  return true;
 }
