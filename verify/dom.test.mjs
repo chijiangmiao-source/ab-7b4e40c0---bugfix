@@ -114,7 +114,7 @@ function byId(id) {
       const tb = new El('tbody');
       e.appendChild(tb);
     }
-    if (id.startsWith('r-order-badge') || id.startsWith('r-once-badge')) {
+    if (id.startsWith('r-order-badge') || id.startsWith('r-once-badge') || id.startsWith('r-query-badge')) {
       e.appendChild(new El('strong'));
     }
     ids.set(id, e);
@@ -165,6 +165,8 @@ test('页面启动为空库，录入 + 分裂批次 + 各事件路径无运行�
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(byId('r-gen').textContent, '2');
   assert.match(byId('audit-out').innerHTML, /期望 8 键/);
+  assert.equal(byId('r-query-badge').querySelector('strong').textContent, '全部可达', '点查询路径徽章');
+  assert.match(byId('audit-out').innerHTML, /点查询核验通过/);
   assert.match(JSON.parse(byId('receipt-out').textContent).status, /committed/);
 
   // 冲突重传：内容不同

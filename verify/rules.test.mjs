@@ -63,6 +63,7 @@ test('有效分裂：跨叶分裂与根提升后所有键仍恰好一次出现',
   assert.deepEqual(audit, {
     pass: true, expectedCount: 13, actualCount: 13,
     missing: [], extra: [], dupes: [], ordered: true,
+    queryable: true, navigationProblems: [],
   });
   assert.equal(engine.lookup(40).value, '四十-改');
   assert.equal(engine.lookup(5).value, '五');
@@ -509,4 +510,296 @@ test('结果视图包含根代次、可达页、有序叶序列与恢复结论',
   assert.equal(snap.leafSequence.length, 7);
   assert.deepEqual(snap.leafSequence.map((x) => x.key), [10, 20, 30, 40, 50, 60, 70]);
   for (const p of snap.pages) assert.match(p.digest, /^[0-9a-f]{16}$/);
+});
+
+// ---------- 六、深层索引：叶序审计与点查询必须同时正确 ----------
+
+const TEN_STEPS_14 = Array.from({ length: 14 }, (_, i) => [(i + 1) * 10, `w${(i + 1) * 10}`]);
+const SIXTEEN_KEYS = Array.from({ length: 16 }, (_, i) => (i + 1) * 10);
+
+test('深层索引正常提交：所有叶中键既可经查询路径读取也可更新，叶序审计与点查询同时通过', async () => {
+  const store = new MemoryStore();
+  const engine = new Engine(store);
+  await engine.open();
+  await engine.initialize(TEN_STEPS_14);
+  const r = await engine.submitBatch([
+    { op: 'insert', key: 150, value: 'w150' },
+    { op: 'insert', key: 160, value: 'w160' },
+  ], 'deep-normal');
+  assert.equal(r.status, 'committed');
+  const snap = engine.snapshot();
+  assert.ok(snap.reachablePages >= 12, '深层树应达到深层分隔键重算的规模');
+  assert.ok(snap.ordered && snap.allKeysOnce);
+  assert.ok(snap.pointQueryOk, '点查询核验：' + snap.navigationProblems.join('；'));
+  assert.ok(snap.audit.pass);
+  for (const k of SIXTEEN_KEYS) assert.equal(engine.lookup(k).value, `w${k}`, `键 ${k} 必须可查`);
+  const upd = await engine.submitBatch([{ op: 'update', key: 70, value: '改70' }], 'deep-upd70');
+  assert.equal(upd.status, 'committed');
+  assert.equal(engine.lookup(70).value, '改70');
+  assert.equal(engine.lookup(80).value, 'w80', '相邻叶键不受影响');
+});
+
+test('深层索引阶段二（意图持久化后）断电重开：发布的新根上叶序审计与点查询同时正确', async () => {
+  const store = new MemoryStore();
+  const engine = new Engine(store);
+  await engine.open();
+  await engine.initialize(TEN_STEPS_14);
+  const oldRoot = engine.state.rootId;
+  const ack = await engine.submitBatch([
+    { op: 'insert', key: 150, value: 'w150' },
+    { op: 'insert', key: 160, value: 'w160' },
+  ], 'deep-crash', CRASH_POINTS.AFTER_INTENT);
+  assert.equal(ack.status, 'interrupted');
+  assert.equal(engine.state.rootId, oldRoot);
+
+  const e2 = new Engine(store);
+  const report = await e2.open();
+  assert.equal(report.conclusion, 'NEW_ROOT_PUBLISHED');
+  const snap = e2.snapshot();
+  assert.equal(snap.keyCount, 16);
+  assert.ok(snap.ordered && snap.allKeysOnce, '叶序严格有序、每键一次');
+  assert.ok(snap.pointQueryOk, '点查询不得因叶序审计通过而被掩盖：' + snap.navigationProblems.join('；'));
+  assert.ok(snap.audit.pass);
+  for (const k of SIXTEEN_KEYS) {
+    const hit = e2.lookup(k);
+    assert.ok(hit, `叶序列中的键 ${k} 必须经查询路径读到`);
+    assert.equal(hit.value, `w${k}`);
+  }
+  // 曾被错误路由的键 70 必须可以更新
+  const upd = await e2.submitBatch([{ op: 'update', key: 70, value: '新70' }], 'deep-fix-upd');
+  assert.equal(upd.status, 'committed');
+  assert.equal(e2.lookup(70).value, '新70');
+
+  // 再次打开（刷新页面）：结论稳定为 INTACT，更新持久化，现象不复发
+  const e3 = new Engine(store);
+  const report3 = await e3.open();
+  assert.equal(report3.conclusion, 'INTACT');
+  assert.equal(e3.lookup(70).value, '新70');
+  assert.ok(e3.snapshot().pointQueryOk);
+});
+
+test('发布闸门：候选新根引用闭合、摘要合法、叶序与键集合一致但点查询失效时，保留旧根', async () => {
+  const store = new MemoryStore();
+  const engine = new Engine(store);
+  await engine.open();
+  await engine.initialize(TEN_STEPS_14);
+  const oldRoot = engine.state.rootId;
+  await engine.submitBatch([
+    { op: 'insert', key: 150, value: 'w150' },
+    { op: 'insert', key: 160, value: 'w160' },
+  ], 'deep-gate', CRASH_POINTS.AFTER_INTENT);
+
+  // 篡改候选根：仅改分隔键（引用顺序、叶页全部不动），重算摘要使摘要校验通过
+  const intent = await store.get('intent');
+  const candidate = await store.get('page:' + intent.rootId);
+  assert.equal(candidate.type, 'internal');
+  const tampered = { ...candidate, keys: [90, 150] }; // 正确应为 [70,130]
+  tampered.digest = digestPage(tampered);
+  await store.put('page:' + candidate.id, tampered);
+
+  const e2 = new Engine(store);
+  const report = await e2.open();
+  assert.equal(report.conclusion, 'OLD_ROOT_RETAINED');
+  assert.match(report.detail, /点查询/);
+  assert.equal(e2.state.rootId, oldRoot);
+  assert.equal(e2.snapshot().gen, 1);
+  assert.equal(e2.lookup(70).value, 'w70', '旧根既有键仍可查询');
+  assert.equal(e2.lookup(150), null, '新键不进入查询视图');
+  assert.equal((await store.get('receipt:deep-gate')).status, 'rolled-back');
+  const stored = await store.allPageIds();
+  assert.equal(stored.length, e2.snapshot().reachablePages, '候选孤儿页被清除');
+});
+
+test('已持久化的受影响索引重新打开：安全收敛为可查询根；再次打开稳定，不显示为健康旧根', async () => {
+  const store = new MemoryStore();
+  const engine = new Engine(store);
+  await engine.open();
+  await engine.initialize(TEN_STEPS_14);
+  const good = await engine.submitBatch([
+    { op: 'insert', key: 150, value: 'w150' },
+    { op: 'insert', key: 160, value: 'w160' },
+  ], 'affected-committed');
+  assert.equal(good.status, 'committed');
+
+  // 模拟旧版本已经把“分隔键错误的根”持久化（叶页与引用顺序完好、摘要全部合法）
+  const rootPage = engine.state.pages.get(engine.state.rootId);
+  const badRoot = {
+    type: 'internal', id: null, gen: rootPage.gen,
+    keys: [90, 150], children: rootPage.children,
+  };
+  badRoot.digest = digestPage(badRoot);
+  badRoot.id = 'p' + badRoot.digest;
+  await store.put('page:' + badRoot.id, badRoot);
+  await store.put('root', {
+    _id: 'root', rootId: badRoot.id, gen: rootPage.gen, keys: [...SIXTEEN_KEYS],
+  });
+
+  // 第一次重开：绝不当作健康已发布版本，须安全修复为可查询状态
+  const e2 = new Engine(store);
+  const r1 = await e2.open();
+  assert.equal(r1.conclusion, 'REPAIRED_ROOT_PUBLISHED');
+  assert.match(r1.detail, /点查询视图失效/);
+  const snap = e2.snapshot();
+  assert.ok(snap.pointQueryOk && snap.audit.pass);
+  for (const k of SIXTEEN_KEYS) assert.equal(e2.lookup(k).value, `w${k}`, `修复后键 ${k} 可查`);
+  const upd = await e2.submitBatch([{ op: 'update', key: 130, value: '改130' }], 'post-repair-upd');
+  assert.equal(upd.status, 'committed');
+  assert.equal(e2.lookup(130).value, '改130');
+
+  // 再次打开：稳定收敛在可查询状态，结论为 INTACT
+  const e3 = new Engine(store);
+  const r2 = await e3.open();
+  assert.equal(r2.conclusion, 'INTACT');
+  assert.equal(e3.lookup(130).value, '改130');
+  assert.equal(e3.lookup(70).value, 'w70');
+  assert.equal(e3.lookup(160).value, 'w160');
+  assert.ok(e3.snapshot().pointQueryOk && e3.snapshot().audit.pass);
+  const stored = await store.allPageIds();
+  assert.equal(stored.length, e3.snapshot().reachablePages, '失效旧内部页已回收');
+});
+
+// 顺序脚本作用在参考映射上的精确模拟：整批任一操作不合法即返回 null（与引擎整批拒绝对应）
+function simulateScript(script, ref) {
+  const next = new Map(ref);
+  for (const e of script) {
+    if (e.op === 'insert') {
+      if (next.has(e.key)) return null;
+      next.set(e.key, e.value);
+    } else if (e.op === 'delete') {
+      if (!next.has(e.key)) return null;
+      next.delete(e.key);
+    } else {
+      if (!next.has(e.key)) return null;
+      next.set(e.key, e.value);
+    }
+  }
+  return next;
+}
+
+test('随机顺序脚本（固定种子）下点查询始终与参考映射一致，含深层树与多次重开', async () => {
+  let seed = 0x1234abcd;
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed / 2147483648;
+  };
+  const store = new MemoryStore();
+  let engine = new Engine(store);
+  await engine.open();
+  await engine.initialize([[0, 'v0']]);
+  const ref = new Map([[0, 'v0']]);
+  let seq = 0;
+  for (let round = 0; round < 60; round++) {
+    const edits = [];
+    let guard = 0;
+    while (edits.length < 6 && guard++ < 40) {
+      const key = Math.floor(rnd() * 40);
+      const roll = rnd();
+      if (!ref.has(key) && roll < 0.65) edits.push({ op: 'insert', key, value: `v${key}` });
+      else if (ref.has(key) && roll < 0.82) edits.push({ op: 'update', key, value: `v${key}-u${round}` });
+      else if (ref.has(key)) edits.push({ op: 'delete', key });
+    }
+    if (!edits.length) continue;
+    const expected = simulateScript(edits, ref);
+    const receipt = await engine.submitBatch(edits, `rand-${seq++}`);
+    if (expected === null) {
+      assert.equal(receipt.status, 'rejected');
+    } else {
+      assert.equal(receipt.status, 'committed');
+      ref.clear();
+      for (const [k, v] of expected) ref.set(k, v);
+    }
+    const snap = engine.snapshot();
+    assert.ok(snap.pointQueryOk, `第 ${round} 轮点查询失效：` + snap.navigationProblems.join('；'));
+    assert.ok(snap.audit.pass);
+    for (let k = 0; k < 40; k++) {
+      const hit = engine.lookup(k);
+      if (ref.has(k)) assert.equal(hit.value, ref.get(k), `第 ${round} 轮键 ${k}`);
+      else assert.equal(hit, null);
+    }
+    if (round % 15 === 14) {
+      const reopened = new Engine(store);
+      const report = await reopened.open();
+      assert.equal(report.conclusion, 'INTACT');
+      engine = reopened;
+    }
+  }
+  assert.ok(engine.snapshot().reachablePages >= 12, '随机用例应已进入深层树规模');
+});
+
+test('删除遗留的悬空分隔键合法：旧分界仍把所有现存键正确路由（等价于既有阶段二恢复语义）', async () => {
+  const { store, engine } = await freshDb();
+  await engine.submitBatch(
+    [{ op: 'insert', key: 5, value: '五' }, { op: 'delete', key: 30 }],
+    'dangling-sep', CRASH_POINTS.AFTER_INTENT,
+  );
+  const { engine: e2, report } = await reopenEngine(store);
+  assert.equal(report.conclusion, 'NEW_ROOT_PUBLISHED');
+  assert.ok(e2.snapshot().pointQueryOk);
+  assert.equal(e2.lookup(30), null, '已删除键经悬空分界仍正确落空');
+  assert.equal(e2.lookup(40).value, '四十', '右子树现存键路由正确');
+  assert.equal(e2.lookup(20).value, '航点廿');
+});
+
+// 构造“深层坏根已发布”的持久化状态（叶页完好、引用闭合、摘要合法、键集合一致）
+async function persistedBrokenDeepRoot(store) {
+  const engine = new Engine(store);
+  await engine.open();
+  await engine.initialize(TEN_STEPS_14);
+  await engine.submitBatch([
+    { op: 'insert', key: 150, value: 'w150' },
+    { op: 'insert', key: 160, value: 'w160' },
+  ], 'seed');
+  const rootPage = engine.state.pages.get(engine.state.rootId);
+  const bad = {
+    type: 'internal', id: null, gen: rootPage.gen, keys: [90, 150], children: rootPage.children,
+  };
+  bad.digest = digestPage(bad);
+  bad.id = 'p' + bad.digest;
+  await store.put('page:' + bad.id, bad);
+  await store.put('root', { _id: 'root', rootId: bad.id, gen: rootPage.gen, keys: [...SIXTEEN_KEYS] });
+  return { badGen: rootPage.gen };
+}
+
+test('坏根已发布且同代次意图仍在（根切换后清理前断电）：修复重发代次并作废意图，原批次标识可重新提交', async () => {
+  const store = new MemoryStore();
+  const { badGen } = await persistedBrokenDeepRoot(store);
+  // 留下一个落后的在途意图（模拟根切换后、意图清理前断电的旧版本落库）
+  await store.put('intent', {
+    batchId: 'stale-pending', editDigest: 'x', gen: badGen + 1,
+    rootId: 'p' + '0'.repeat(16), keys: [...SIXTEEN_KEYS, 170], pageIds: [],
+  });
+
+  const e2 = new Engine(store);
+  const r = await e2.open();
+  assert.equal(r.conclusion, 'REPAIRED_ROOT_PUBLISHED');
+  assert.ok(e2.snapshot().pointQueryOk);
+  assert.equal(e2.snapshot().gen, badGen + 2, '修复代次高于旧根与在途意图');
+  assert.equal(await store.get('intent'), undefined, '落后意图已作废');
+  assert.equal(await store.get('receipt:stale-pending'), undefined, '未伪造终局回执');
+  // 原批次标识可正常重新提交
+  const redone = await e2.submitBatch([{ op: 'insert', key: 170, value: 'w170' }], 'stale-pending');
+  assert.equal(redone.status, 'committed');
+  assert.equal(e2.lookup(170).value, 'w170');
+});
+
+test('修复已切根但遗留意图删除前再次断电：重开作废过期意图、保持可查询根', async () => {
+  const store = new MemoryStore();
+  const { badGen } = await persistedBrokenDeepRoot(store);
+  // 先做一次修复
+  let e = new Engine(store);
+  await e.open();
+  assert.equal((await store.get('root')).gen, badGen + 1);
+  // 手工塞回一个“修复时本该删掉”的落后意图（模拟切根后、删意图前断电）
+  await store.put('intent', {
+    batchId: 'leftover', editDigest: 'x', gen: badGen, rootId: 'p' + '0'.repeat(16),
+    keys: [...SIXTEEN_KEYS], pageIds: [],
+  });
+
+  const e2 = new Engine(store);
+  const r = await e2.open();
+  assert.equal(r.conclusion, 'INTACT');
+  assert.equal(e2.state.gen, badGen + 1, '可查询根不变');
+  assert.equal(await store.get('intent'), undefined);
+  assert.equal(e2.lookup(70).value, 'w70');
+  assert.ok(e2.snapshot().pointQueryOk);
 });

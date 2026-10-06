@@ -8,7 +8,8 @@
 //   意图存在但页缺失/损坏 -> 保留旧根，剔除未竟意图与孤儿页，给出原因
 
 import {
-  applyEdits, buildTree, closure, orderedLeaves, RuleError, ORDER,
+  applyEdits, buildTree, closure, orderedLeaves, navigationProblems,
+  rebuildTreeFromLeaves, RuleError, Writer, ORDER,
 } from './bptree.mjs';
 import { fnv1a64, stableStringify, verifyDigest } from './digest.mjs';
 
@@ -173,12 +174,24 @@ export class Engine {
     const keySet = new Set(rootRec.keys ?? []);
     this.state = { rootId: rootRec.rootId, gen: rootRec.gen, pages, keySet, corrupt, loadProblems };
 
+    // 已发布根在引用闭合、摘要合法之外，还必须满足“点查询不变量”：
+    // 叶序列严格有序、与已提交键集合一致，且分隔键都在有效分界内、每个叶中键都能被查询路径命中。
+    // 否则会出现“叶序审计通过、点查询却读不到叶中既有键”的失效视图。
+    const structureProblems = loadProblems.length || corrupt.length
+      ? []
+      : treeEvidenceProblems(pages, rootRec.rootId, keySet);
+
     let report;
     if (loadProblems.length || corrupt.length) {
       // 已发布根自身不可信：绝不自动改写，批次操作一律拒绝直到人工处理
       report = this.recoveryReport('PUBLISHED_ROOT_UNHEALTHY',
         `已发布根（代次 ${rootRec.gen}）健康检查失败：${[...loadProblems, ...corrupt].join('；')}。冻结于该根，不发布任何新树`);
       if (intent) await this.abandonIntent(intent, '已发布根不健康，未竟意图不予执行');
+    } else if (structureProblems.length) {
+      // 页都在、摘要都对、叶序也完整，但分隔键已使查询视图失效：
+      // 以经鉴权的叶序列为唯一事实源安全收敛，重建祖先页后重新发布，
+      // 绝不继续把它当作健康的已发布版本展示。
+      report = await this.repairPublishedRoot(rootRec, pages, keySet, structureProblems, intent);
     } else if (!intent) {
       report = this.recoveryReport('INTACT', '未发现未完成批次，查询视图即已发布根');
       await this.gcUnreachable(pages); // 上次断电在新页阶段留下的半写入孤儿
@@ -188,10 +201,71 @@ export class Engine {
       await this.gcUnreachable(pages);
       report = this.recoveryReport('NEW_ROOT_PUBLISHED',
         `批次 ${intent.batchId} 的根指针已切换（代次 ${intent.gen}），仅补完清理；新树可完整遍历`);
+    } else if (intent.gen < rootRec.gen) {
+      // 意图落后于已发布根（如修复重发代次后、遗留意图删除前再次断电）：
+      // 意图已过期，直接作废（不写终局回滚回执，以便审查员用原批次标识重新提交），保留可查询根
+      await this.store.delete(K_INTENT);
+      await this.gcUnreachable(pages);
+      report = this.recoveryReport('INTACT',
+        `已发布根（代次 ${rootRec.gen}）可查询；批次 ${intent.batchId} 的遗留意图代次已过期，已作废`);
     } else {
       report = await this.resolvePending(intent);
     }
     return report;
+  }
+
+  // 已持久化的已发布根“叶序完好但查询视图失效”时的安全收敛：
+  // 叶页全部通过摘要校验、按中序严格排列，故以叶序列为事实源重建全部内部页，
+  // 新根代次 +1，与根指针原子发布；不触碰任何叶页（键与载荷原样保留）。
+  async repairPublishedRoot(rootRec, pages, keySet, problems, intent) {
+    const leaves = orderedLeaves(pages, rootRec.rootId);
+    // 修复根代次严格高于旧根与任何在途意图代次：即便修复中在“切根后、删意图前”
+    // 再次断电，重开也不会把在途意图误判成已提交批次（gen 不相等）。
+    const gen = Math.max(rootRec.gen, intent?.gen ?? 0) + 1;
+    const w = new Writer(pages, gen);
+    const rebuiltRoot = rebuildTreeFromLeaves(w, leaves);
+    const reachable = closure(w, rebuiltRoot);
+    const newPages = new Map();
+    for (const id of reachable) newPages.set(id, w.out.get(id) ?? pages.get(id));
+
+    // 修复树必须自证：引用闭合、摘要合法、叶序与键集合一致、点查询不变量全部通过
+    const recheck = treeEvidenceProblems(newPages, rebuiltRoot, keySet);
+    if (recheck.length) {
+      // 自愈失败（理论上不应发生）：冻结原根，绝不当作健康版本展示，任何批次拒绝写入
+      this.state = {
+        rootId: rootRec.rootId, gen: rootRec.gen, pages, keySet,
+        corrupt: [], loadProblems: [`点查询视图失效且自愈失败：${recheck.join('；')}`],
+      };
+      if (intent) await this.abandonIntent(intent, '已发布根不健康，未竟意图不予执行');
+      return this.recoveryReport('PUBLISHED_ROOT_UNHEALTHY',
+        `已发布根（代次 ${rootRec.gen}）点查询视图失效且按叶序列重建后仍未通过核验：${recheck.join('；')}。已冻结原根，不发布任何新树`);
+    }
+
+    const leafKeys = [];
+    for (const leaf of orderedLeaves(newPages, rebuiltRoot)) leafKeys.push(...leaf.keys);
+    const writes = [];
+    for (const p of newPages.values()) {
+      if (w.out.has(p.id)) writes.push([K_PAGE(p.id), p]);
+    }
+    writes.push([K_ROOT, { _id: K_ROOT, rootId: rebuiltRoot, gen, keys: leafKeys.sort((a, b) => a - b) }]);
+    writes.push([`repair:${rootRec.gen}`, {
+      _id: `repair:${rootRec.gen}`, fromRootId: rootRec.rootId, rootId: rebuiltRoot,
+      gen, fromGen: rootRec.gen, reason: problems.join('；'), repairedAt: this.now(),
+    }]);
+    await this.store.putMany(writes);
+    if (intent) {
+      // 该意图针对失效根算出，随修复一并作废；不写终局回执，审查员可用同一批次标识重新提交
+      await this.store.delete(K_INTENT);
+    }
+    this.state = {
+      rootId: rebuiltRoot, gen, pages: newPages,
+      keySet: new Set(leafKeys), corrupt: [], loadProblems: [],
+    };
+    await this.gcUnreachable(newPages, rebuiltRoot);
+    const intentNote = intent ? `；未竟批次 ${intent.batchId} 的意图已作废，可用原批次标识重新提交` : '';
+    return this.recoveryReport('REPAIRED_ROOT_PUBLISHED',
+      `已发布根（代次 ${rootRec.gen}）页摘要与引用均完好，但点查询视图失效（${problems.join('；')}）。` +
+      `已按叶序列重建内部页并发布代次 ${gen} 可查询根，叶页键值原样保留${intentNote}`);
   }
 
   // 意图存在但根尚未切换：凭证据决定发布新根或退回旧根
@@ -212,6 +286,14 @@ export class Engine {
       } catch (e) {
         closureOk = false;
         problems.push(e.message);
+      }
+    }
+
+    // 引用闭合之后，还须验证点查询视图本身：叶序严格有序且与意图键集合一致、
+    // 每个分隔键等于右子树最小叶键——避免“叶序审计通过却查不到叶中既有键”。
+    if (problems.length === 0 && closureOk) {
+      for (const msg of treeEvidenceProblems(newPages, intent.rootId, new Set(intent.keys ?? []))) {
+        problems.push(msg);
       }
     }
 
@@ -244,7 +326,7 @@ export class Engine {
       gen: intent.gen, reason: problems.join('；'), createdAt: this.now(),
     });
     return this.recoveryReport('OLD_ROOT_RETAINED',
-      `批次 ${intent.batchId} 持久化证据不完整（${problems.join('；')}），保留代次 ${this.state.gen} 旧根，半写入页不进入查询视图`);
+      `批次 ${intent.batchId} 持久化证据不完整或点查询核验失败（${problems.join('；')}），保留代次 ${this.state.gen} 旧根，半写入页不进入查询视图`);
   }
 
   recoveryReport(conclusion, detail) {
@@ -465,6 +547,11 @@ export function snapshotOf(pages, rootId, gen, recovery = null) {
   const keys = leafOrder.map((x) => x.key);
   const sorted = keys.every((k, i) => i === 0 || keys[i - 1] < k);
   const unique = new Set(keys).size === keys.length;
+  // 叶序审计之外独立核验点查询路径（引用闭合时才做）：
+  // 叶序再整齐，分隔键错了查询视图仍然失效，二者必须分别成立。
+  const navErrors = badRefs.length === 0 && rootId
+    ? navigationProblems(pages, rootId)
+    : [];
   return {
     order: ORDER,
     rootId,
@@ -477,6 +564,8 @@ export function snapshotOf(pages, rootId, gen, recovery = null) {
     keyCount: keys.length,
     ordered: sorted,
     allKeysOnce: sorted && unique,
+    pointQueryOk: navErrors.length === 0,
+    navigationProblems: navErrors,
     badReferences: badRefs,
     recovery,
   };
@@ -489,13 +578,57 @@ export function auditKeys(snapshot, expectedKeys) {
   const missing = exp.filter((k) => !got.includes(k));
   const extra = got.filter((k) => !expectedKeys.has(k));
   const dupes = got.filter((k, i) => got.indexOf(k) !== i);
+  const navErrors = snapshot.navigationProblems ?? [];
   return {
-    pass: snapshot.allKeysOnce && missing.length === 0 && extra.length === 0 && dupes.length === 0,
+    pass: snapshot.allKeysOnce && missing.length === 0 && extra.length === 0
+      && dupes.length === 0 && navErrors.length === 0,
     expectedCount: expectedKeys.size,
     actualCount: got.length,
     missing, extra, dupes,
     ordered: snapshot.ordered,
+    queryable: navErrors.length === 0,
+    navigationProblems: navErrors,
   };
+}
+
+// 发布 / 自愈前的结构证据核验（调用方已保证引用闭合、摘要合法）：
+// 叶序严格有序、与已提交键集合逐一对应、且点查询不变量成立。
+// 任一项失败都不得把候选根当作可查询版本发布。
+export function treeEvidenceProblems(pages, rootId, expectedKeys) {
+  const problems = [];
+  let leaves;
+  try {
+    leaves = orderedLeaves(pages, rootId);
+  } catch (e) {
+    return [e.message];
+  }
+  const got = [];
+  for (const leaf of leaves) {
+    for (let i = 1; i < leaf.keys.length; i++) {
+      if (leaf.keys[i - 1] >= leaf.keys[i]) {
+        problems.push(`叶页 ${leaf.id} 内键未严格递增：${leaf.keys[i - 1]} 后出现 ${leaf.keys[i]}`);
+      }
+    }
+    got.push(...leaf.keys);
+  }
+  for (let i = 1; i < got.length; i++) {
+    if (got[i - 1] >= got[i]) {
+      problems.push(`叶序列在 ${got[i - 1]} 与 ${got[i]} 之间未严格递增`);
+      break;
+    }
+  }
+  const dupes = got.filter((k, i) => got.indexOf(k) !== i);
+  if (dupes.length) problems.push(`叶序列存在重复键：${[...new Set(dupes)].join('、')}`);
+  const exp = expectedKeys instanceof Set ? expectedKeys : new Set(expectedKeys ?? []);
+  const missing = [...exp].filter((k) => !got.includes(k));
+  const extra = [...new Set(got.filter((k) => !exp.has(k)))];
+  if (missing.length) problems.push(`相对已提交键集合丢失键：${missing.join('、')}`);
+  if (extra.length) problems.push(`叶序列出现已提交集合之外的键：${extra.join('、')}`);
+  // 叶序/键集合都通过后再验证点查询路径，避免错误叠加导致噪声
+  if (!problems.length) {
+    for (const msg of navigationProblems(pages, rootId)) problems.push(msg);
+  }
+  return problems;
 }
 
 export { RuleError, ORDER };

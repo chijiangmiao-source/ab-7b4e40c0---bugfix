@@ -203,6 +203,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .banner.intact { border-color: #1f5c45; background: #0f211c; color: #b8f0d8; }
 .banner.new { border-color: #1e4a7a; background: #10233a; color: #cfe6ff; }
 .banner.old { border-color: #7a5a1e; background: #2c2110; color: #ffe2b0; }
+.banner.repair { border-color: #1e7a6b; background: #0f2a2c; color: #b8f4ff; }
 .banner.unhealthy { border-color: #7a1e2a; background: #2c1015; color: #ffc3c3; }
 .banner .banner-title { font-weight: 700; margin-right: 8px; }
 

@@ -9,7 +9,7 @@ for (const id of [
   'batch-card', 'batch-id', 'edit-table', 'edit-count', 'btn-add-edit', 'crash-point',
   'btn-submit', 'btn-reopen', 'btn-lookup', 'lookup-key', 'btn-reset',
   'receipt-out', 'r-gen', 'r-pages', 'r-kinds', 'r-keys', 'r-order-badge', 'r-once-badge',
-  'r-rootid', 'audit-out', 'leafseq', 'pages-out',
+  'r-query-badge', 'r-rootid', 'audit-out', 'leafseq', 'pages-out',
 ]) els[id] = $(id);
 
 let engine = null;
@@ -40,6 +40,7 @@ const BANNER_CLASS = {
   INTACT: 'intact',
   NEW_ROOT_PUBLISHED: 'new',
   OLD_ROOT_RETAINED: 'old',
+  REPAIRED_ROOT_PUBLISHED: 'repair',
   PUBLISHED_ROOT_UNHEALTHY: 'unhealthy',
 };
 const BANNER_TITLE = {
@@ -47,6 +48,7 @@ const BANNER_TITLE = {
   INTACT: '复核通过',
   NEW_ROOT_PUBLISHED: '发布完整新根',
   OLD_ROOT_RETAINED: '保留旧根',
+  REPAIRED_ROOT_PUBLISHED: '失效根已安全修复',
   PUBLISHED_ROOT_UNHEALTHY: '已发布根不健康',
 };
 
@@ -240,6 +242,7 @@ function render() {
     els['audit-out'].innerHTML = '<div class="empty-hint">尚无审计结果。</div>';
     setBadge('r-order-badge', false, '—');
     setBadge('r-once-badge', false, '—');
+    setBadge('r-query-badge', false, '—');
     return;
   }
   const snap = engine.snapshot();
@@ -250,6 +253,7 @@ function render() {
   els['r-rootid'].textContent = snap.rootId;
   setBadge('r-order-badge', snap.ordered, snap.ordered ? '严格递增' : '失序');
   setBadge('r-once-badge', snap.allKeysOnce, snap.allKeysOnce ? '是' : '否');
+  setBadge('r-query-badge', snap.pointQueryOk, snap.pointQueryOk ? '全部可达' : '查询失效');
   renderAudit(snap);
   renderLeafSequence(snap);
   renderPages(snap);
@@ -272,6 +276,13 @@ function renderAudit(snap) {
       ? `分裂审计通过：期望 ${a.expectedCount} 键，叶序实得 ${a.actualCount} 键，全部严格有序且每键恰好出现一次。`
       : `审计未通过：期望 ${a.expectedCount} 键，实得 ${a.actualCount} 键。`]);
   if (!a.ordered) lines.push(['fail', '✘', '叶序列并非严格按键递增。']);
+  if (!a.queryable) {
+    lines.push(['fail', '✘', '点查询路径失效：叶序列中的键无法全部经查询路由读到，叶序审计通过也不能发布为可查询版本。']);
+    for (const msg of (a.navigationProblems ?? []).slice(0, 6)) {
+      lines.push(['fail', '↳', escapeHtml(msg)]);
+    }
+  }
+  if (a.queryable) lines.push(['pass', '✔', '点查询核验通过：叶序列中每个键都能沿分隔键路径读取与编辑。']);
   if (a.dupes.length) lines.push(['fail', '✘', `重复出现的键：${a.dupes.map(chip).join('')}`]);
   if (a.missing.length) lines.push(['fail', '✘', `丢失的键：${a.missing.map(chip).join('')}`]);
   if (a.extra.length) lines.push(['fail', '✘', `多余的键：${a.extra.map(chip).join('')}`]);

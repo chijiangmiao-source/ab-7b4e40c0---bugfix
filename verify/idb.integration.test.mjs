@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { installFakeIndexedDB } from './fake-idb.mjs';
 import { IDBStore } from '../site/src/store.mjs';
 import { Engine, CRASH_POINTS } from '../site/src/engine.mjs';
+import { digestPage } from '../site/src/digest.mjs';
 
 const DB = 'track-idb-test';
 
@@ -92,4 +93,84 @@ test('IDB 适配层：单事务 putMany 后根与回执同时可见', async () =
   assert.deepEqual(root.keys, [1, 2]);
   assert.equal(await store.get('intent'), undefined);
   await store.close();
+});
+
+test('IDB 适配层：深层索引阶段二断电后以全新进程视角重开，叶序审计与点查询同时正确', async () => {
+  const name = DB + '-deep-crash';
+  let store = await IDBStore.open(name);
+  let engine = new Engine(store);
+  await engine.open();
+  await engine.initialize(Array.from({ length: 14 }, (_, i) => [(i + 1) * 10, `w${(i + 1) * 10}`]));
+  await engine.submitBatch([
+    { op: 'insert', key: 150, value: 'w150' },
+    { op: 'insert', key: 160, value: 'w160' },
+  ], 'deep-idb', CRASH_POINTS.AFTER_INTENT);
+  await store.close();
+
+  const store2 = await IDBStore.open(name);
+  const e2 = new Engine(store2);
+  const report = await e2.open();
+  assert.equal(report.conclusion, 'NEW_ROOT_PUBLISHED');
+  const snap = e2.snapshot();
+  assert.equal(snap.keyCount, 16);
+  assert.ok(snap.audit.pass && snap.pointQueryOk, snap.navigationProblems.join('；'));
+  assert.equal(e2.lookup(70).value, 'w70');
+  assert.equal(e2.lookup(140).value, 'w140');
+  const upd = await e2.submitBatch([{ op: 'update', key: 70, value: '改70' }], 'deep-idb-upd');
+  assert.equal(upd.status, 'committed');
+  assert.equal(e2.lookup(70).value, '改70');
+  await store2.close();
+
+  // 再开一次：现象不复发
+  const store3 = await IDBStore.open(name);
+  const e3 = new Engine(store3);
+  const report3 = await e3.open();
+  assert.equal(report3.conclusion, 'INTACT');
+  assert.equal(e3.lookup(70).value, '改70');
+  assert.ok(e3.snapshot().pointQueryOk);
+  await store3.close();
+});
+
+test('IDB 适配层：已持久化的查询失效根重开时自愈为可查询版本，再开稳定', async () => {
+  const name = DB + '-deep-repair';
+  let store = await IDBStore.open(name);
+  let engine = new Engine(store);
+  await engine.open();
+  await engine.initialize(Array.from({ length: 14 }, (_, i) => [(i + 1) * 10, `w${(i + 1) * 10}`]));
+  await engine.submitBatch([
+    { op: 'insert', key: 150, value: 'w150' },
+    { op: 'insert', key: 160, value: 'w160' },
+  ], 'deep-committed');
+
+  // 把根内部页改成分隔键错误的版本（叶页完好、摘要合法），等价旧版本已落库
+  const rootPage = engine.state.pages.get(engine.state.rootId);
+  const bad = { type: 'internal', id: null, gen: rootPage.gen, keys: [90, 150], children: rootPage.children };
+  bad.digest = digestPage(bad);
+  bad.id = 'p' + bad.digest;
+  await store.put('page:' + bad.id, bad);
+  await store.put('root', {
+    _id: 'root', rootId: bad.id, gen: rootPage.gen,
+    keys: Array.from({ length: 16 }, (_, i) => (i + 1) * 10),
+  });
+  await store.close();
+
+  const store2 = await IDBStore.open(name);
+  const e2 = new Engine(store2);
+  const r1 = await e2.open();
+  assert.equal(r1.conclusion, 'REPAIRED_ROOT_PUBLISHED');
+  assert.equal(e2.lookup(70).value, 'w70');
+  assert.equal(e2.lookup(140).value, 'w140');
+  const upd = await e2.submitBatch([{ op: 'update', key: 130, value: '改130' }], 'repaired-upd');
+  assert.equal(upd.status, 'committed');
+  assert.equal(e2.lookup(130).value, '改130');
+  await store2.close();
+
+  const store3 = await IDBStore.open(name);
+  const e3 = new Engine(store3);
+  const r2 = await e3.open();
+  assert.equal(r2.conclusion, 'INTACT');
+  assert.equal(e3.lookup(70).value, 'w70');
+  assert.equal(e3.lookup(130).value, '改130');
+  assert.ok(e3.snapshot().pointQueryOk && e3.snapshot().audit.pass);
+  await store3.close();
 });

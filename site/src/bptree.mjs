@@ -32,7 +32,7 @@ function makeInternal(gen, { keys = [], children = [] } = {}) {
 }
 
 // 在不可变快照 src(id->page) 上产出一批新版本页。
-class Writer {
+export class Writer {
   constructor(src, gen) {
     this.src = src;
     this.gen = gen;
@@ -51,6 +51,7 @@ class Writer {
     return stamp({ ...page, ...patch, gen: this.gen, id: null });
   }
   leaf(keys, values) { return this.emit(makeLeaf(this.gen, { keys, values })); }
+  internal(keys, children) { return this.emit(makeInternal(this.gen, { keys, children })); }
 
   // 在键序列中定位子节点下标：children[i] 容纳 key
   static childIndex(keys, key) {
@@ -331,19 +332,21 @@ export function applyEdits(srcPages, rootId, gen, edits) {
   return { rootId: cur, gen, pages };
 }
 
+// 深层批次后重算全部内部页分隔键：分隔键必须等于其右侧相邻子树的“最小叶键”，
+// 而不是内部子节点自身的第一个分隔键——两者在深度 >=3 时并不相等，
+// 取错会让中序叶序列仍然严格有序、点查询却路由到错误叶页。
 function normalizeDeepSeparators(w, rootId) {
+  // 自底向上重建，返回重建后页 id 与该子树最小叶键（最左叶首键）
   const normalize = (id) => {
     const node = w.get(id);
-    if (!node) throw new Error(`无法闭合的子页引用: ${id}`);
-    if (node.type === 'leaf') return id;
-    const children = node.children.map(normalize);
-    const keys = children.slice(1).map((childId) => {
-      const child = w.get(childId);
-      return child.keys[0];
-    });
-    return w.emit(w.copy(node, { keys, children }));
+    if (!node) throw new RuleError('BROKEN_REFERENCE', `无法闭合的子页引用: ${id}`);
+    if (node.type === 'leaf') return { id, minKey: node.keys[0] };
+    const parts = node.children.map(normalize);
+    const keys = parts.slice(1).map((p) => p.minKey);
+    const newId = w.emit(w.copy(node, { keys, children: parts.map((p) => p.id) }));
+    return { id: newId, minKey: parts[0].minKey };
   };
-  return normalize(rootId);
+  return normalize(rootId).id;
 }
 
 function topFromSplit(w, r) {
@@ -405,4 +408,104 @@ export function orderedLeaves(pages, rootId) {
   };
   go(rootId);
   return out;
+}
+
+// 沿点查询路径（内部页分隔键路由）读取一个键；页缺失即抛错。
+export function pointGet(pages, rootId, key) {
+  let id = rootId;
+  while (id != null) {
+    const p = pages.get(id);
+    if (!p) throw new RuleError('BROKEN_REFERENCE', `查询遇无法闭合的引用: ${id}`);
+    if (p.type === 'leaf') {
+      const i = p.keys.indexOf(key);
+      return i < 0 ? null : { key, value: p.values[i], pageId: id };
+    }
+    let i = 0;
+    while (i < p.keys.length && key >= p.keys[i]) i++;
+    id = p.children[i];
+  }
+  return null;
+}
+
+// 点查询路径不变量，两道独立检查：
+//  1. 内部页每个分隔键必须是有效分界：max(左子树叶键) < sep <= min(右子树叶键)。
+//     删除会留下“悬空分隔键”（如右子树最小叶键已从 30 变为 40，sep 仍为 30），
+//     这仍然合法——查不存在的 30 照样落空；真正非法的是分隔键越过某一侧已有叶键。
+//  2. 中序叶序列中的每个键都必须能经真实点查询路径读到（端到端可查询）。
+// 叶序审计（中序遍历）只看 children 顺序、不看 keys，无法发现分隔键越界；
+// 本检查独立保证“叶序列里的每个键都能经查询路径读取和编辑”。
+// 返回失配描述数组，空数组即点查询视图与叶序列一致。
+export function navigationProblems(pages, rootId) {
+  const problems = [];
+  const leafBounds = (id) => {
+    const p = pages.get(id);
+    if (!p) throw new RuleError('BROKEN_REFERENCE', `无法闭合的子页引用: ${id}`);
+    if (p.type === 'leaf') return { min: p.keys[0], max: p.keys[p.keys.length - 1] };
+    let min, max;
+    for (const c of p.children) {
+      const b = leafBounds(c);
+      if (b.min === undefined) continue; // 空子树（删空的叶）不提供边界
+      min = min === undefined ? b.min : Math.min(min, b.min);
+      max = max === undefined ? b.max : Math.max(max, b.max);
+    }
+    return { min, max };
+  };
+  const check = (id) => {
+    const p = pages.get(id);
+    if (!p) throw new RuleError('BROKEN_REFERENCE', `无法闭合的子页引用: ${id}`);
+    if (p.type === 'leaf') return;
+    for (let i = 0; i < p.keys.length; i++) {
+      const left = leafBounds(p.children[i]);
+      const right = leafBounds(p.children[i + 1]);
+      const sep = p.keys[i];
+      if (left.max !== undefined && !(left.max < sep)) {
+        problems.push(`内部页 ${id} 第 ${i + 1} 个分隔键 ${sep} 未大于左子树最大叶键 ${left.max}（左子树既有键会被错误路由到右侧）`);
+      }
+      if (right.min !== undefined && !(sep <= right.min)) {
+        problems.push(`内部页 ${id} 第 ${i + 1} 个分隔键 ${sep} 大于右子树最小叶键 ${right.min}（右子树既有键会被错误路由到左侧）`);
+      }
+    }
+    for (const c of p.children) check(c);
+  };
+  check(rootId);
+
+  // 端到端探针：叶序列中每个键都必须沿分隔键路由命中，且值一致
+  for (const leaf of orderedLeaves(pages, rootId)) {
+    for (let i = 0; i < leaf.keys.length; i++) {
+      const key = leaf.keys[i];
+      const hit = pointGet(pages, rootId, key);
+      if (!hit) problems.push(`叶序列中的既有键 ${key} 无法经查询路径读到（被错误分隔键路由到其他叶页）`);
+      else if (hit.value !== leaf.values[i] || hit.pageId !== leaf.id) {
+        problems.push(`叶序列中的键 ${key} 经查询路径命中了别的叶页（点查询视图与叶序不一致）`);
+      }
+    }
+  }
+  return problems;
+}
+
+// 以中序叶序列为唯一事实源，自底向上重建内部页（分隔键取右子树最小叶键）。
+// 用于修复“叶页与顺序完好、但内部页分隔键已使查询视图失效”的已发布树：
+// 不改动任何叶页（键与载荷原样保留），只重建祖先页，全部产出在同一 Writer.out。
+export function rebuildTreeFromLeaves(w, leaves) {
+  // 空叶不携带任何键值：修复时直接丢弃（随后不可达会被回收），
+  // 避免 undefined 最小键污染分隔键；全空则退化为单一空叶根。
+  leaves = leaves.filter((p) => p.keys.length > 0);
+  if (leaves.length === 0) return w.leaf([], []);
+  // level: 当前层全部节点 { id, minKey }，按叶序排列
+  let level = leaves.map((p) => ({ id: p.id, minKey: p.keys[0] }));
+  while (level.length > 1) {
+    const next = [];
+    let pos = 0;
+    while (pos < level.length) {
+      const remaining = level.length - pos;
+      let size = Math.min(ORDER, remaining);
+      if (remaining - size === 1) size -= 1; // 末组不得只剩 1 个节点（内部页至少 2 子）
+      const group = level.slice(pos, pos + size);
+      pos += size;
+      const id = w.internal(group.slice(1).map((n) => n.minKey), group.map((n) => n.id));
+      next.push({ id, minKey: group[0].minKey });
+    }
+    level = next;
+  }
+  return level[0].id;
 }
